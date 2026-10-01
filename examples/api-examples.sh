@@ -214,4 +214,66 @@ curl -sS -X POST "${AUTH[@]}" \
   -F "package=@${PARTS[0]%%|*};filename=pack-b-1.0.0.bin" \
   "$API/batches" | python3 -m json.tool || true
 
+# 16) 安装包核验与修复（长期保存丢失/损坏）
+# 内容寻址路径：$PACKAGE_DIR/<sha前2位>/<sha>。脚本与服务同机时可直接模拟丢失。
+PKG_STORE="${PACKAGE_DIR:-/data/packages}"
+SHA_A="$(sha256_file "${PARTS[0]%%|*}")"
+STORED_A="$PKG_STORE/${SHA_A:0:2}/$SHA_A"
+
+echo ">>> 核验 pack-a 1.0.0（应 status=ok，含共享摘要版本数）"
+curl -fsS "$API/plugins/pack-a/versions/1.0.0/verify" | python3 -m json.tool
+
+if [[ -f "$STORED_A" ]]; then
+  echo ">>> 模拟长期保存丢失：删除内容寻址文件 $STORED_A"
+  rm -f "$STORED_A"
+
+  echo ">>> 核验应为 status=missing"
+  curl -fsS "$API/plugins/pack-a/versions/1.0.0/verify" \
+    | python3 -c 'import json,sys;print("status:",json.load(sys.stdin)["status"])'
+  echo ">>> 下载缺失包（应 404 package_missing，绝不作为成功下载返回）"
+  curl -sS "$API/plugins/pack-a/versions/1.0.0/download" | python3 -m json.tool || true
+
+  echo ">>> 用同一内容的替换文件原子修复（应 repaired，同摘要版本一并恢复）"
+  curl -fsS -X POST "${AUTH[@]}" \
+    -F "package=@${PARTS[0]%%|*};filename=pack-a-1.0.0.bin" \
+    "$API/plugins/pack-a/versions/1.0.0/repair" \
+    | python3 -c 'import json,sys;r=json.load(sys.stdin);
+print("status:",r["status"],"affected_version_count:",r["affected_version_count"])'
+
+  echo ">>> 恢复后下载成功，X-SHA256 与记录一致"
+  curl -fsS -D - -o "$tmpdir/pack-a-recovered.bin" \
+    "$API/plugins/pack-a/versions/1.0.0/download" | grep -Ei 'HTTP|x-sha256|x-revoked'
+  [[ "$(sha256_file "$tmpdir/pack-a-recovered.bin")" == "$SHA_A" ]] && echo "本地复核一致"
+
+  echo ">>> 模拟长期保存损坏：改写内容寻址文件"
+  printf 'corrupted' > "$STORED_A"
+  curl -fsS "$API/plugins/pack-a/versions/1.0.0/verify" \
+    | python3 -c 'import json,sys;r=json.load(sys.stdin);
+print("status:",r["status"],"actual:",(r["actual_sha256"] or "")[:12])'
+  echo ">>> 下载损坏包（应 409 package_corrupt，绝不作为成功下载返回）"
+  curl -sS "$API/plugins/pack-a/versions/1.0.0/download" | python3 -m json.tool || true
+  echo ">>> 原子修复损坏包（应 repaired）"
+  curl -fsS -X POST "${AUTH[@]}" \
+    -F "package=@${PARTS[0]%%|*};filename=pack-a-1.0.0.bin" \
+    "$API/plugins/pack-a/versions/1.0.0/repair" \
+    | python3 -c 'import json,sys;print("status:",json.load(sys.stdin)["status"])'
+else
+  echo ">>> 内容寻址文件不在本机（$STORED_A）；远端服务请在服务主机执行："
+  echo "    损坏：echo bad > <文件>；verify=corrupt、download=409 package_corrupt"
+  echo "    缺失：rm <文件>；     verify=missing、download=404 package_missing"
+fi
+
+echo ">>> 完好包再次修复（应 status=not_needed，不改写、无新修订）"
+curl -fsS -X POST "${AUTH[@]}" \
+  -F "package=@${PARTS[0]%%|*};filename=pack-a-1.0.0.bin" \
+  "$API/plugins/pack-a/versions/1.0.0/repair" \
+  | python3 -c 'import json,sys;r=json.load(sys.stdin);
+print("status:",r["status"],"affected_version_count:",r["affected_version_count"])'
+
+echo ">>> 摘要不符的替换文件（应 422 sha256_mismatch，原文件保留）"
+printf 'totally-different' > "$tmpdir/wrong.bin"
+curl -sS -X POST "${AUTH[@]}" \
+  -F "package=@$tmpdir/wrong.bin;filename=pack-a-1.0.0.bin" \
+  "$API/plugins/pack-a/versions/1.0.0/repair" | python3 -m json.tool || true
+
 echo "全部示例执行完成。"

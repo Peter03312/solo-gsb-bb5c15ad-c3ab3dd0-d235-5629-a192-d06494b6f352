@@ -102,6 +102,27 @@ class Client:
     def batch(self, batch_id: str):
         return self._request("GET", f"/batches/{batch_id}")
 
+    def verify_package(self, plugin: str, version: str):
+        """核验安装包：ok/missing/corrupt + 共享该摘要的版本数（只读开放）。"""
+        return self._request(
+            "GET", f"/plugins/{plugin}/versions/{version}/verify")
+
+    def repair_package(self, plugin: str, version: str, payload: bytes):
+        """提交替换文件原子修复缺失/损坏包（写接口；摘要须与原记录一致）。"""
+        boundary = "----labrepair" + uuid.uuid4().hex
+        buf = io.BytesIO()
+        buf.write(f"--{boundary}\r\n".encode())
+        buf.write(
+            f'Content-Disposition: form-data; name="package"; '
+            f'filename="{plugin}-{version}.bin"\r\n'.encode())
+        buf.write(b"Content-Type: application/octet-stream\r\n\r\n")
+        buf.write(payload)
+        buf.write(f"\r\n--{boundary}--\r\n".encode())
+        return self._request(
+            "POST", f"/plugins/{plugin}/versions/{version}/repair",
+            data=buf.getvalue(),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
     def solve(self, req: dict):
         return self._request("POST", "/solutions", data=req)
 
@@ -307,6 +328,44 @@ def main() -> int:
     st, _, berr = c.publish_batch("batch-demo-dup", [b_lib, b_lib])
     show("批次内重复成员（409）", st, berr)
     assert st == 409
+
+    # ------------------------------------------------------------ 包核验与修复
+    # 两个版本共享同一安装包内容（同一 sha256 -> 同一内容寻址文件）
+    shared = b"shared-payload"
+    pub("repair-lib", "1.0.0", [], content="shared-payload")
+    st, _h, body = c.publish(
+        {"plugin": "repair-lib", "version": "2.0.0",
+         "sha256": hashlib.sha256(shared).hexdigest(),
+         "runtimes": [], "dependencies": [], "conflicts": []}, shared)
+    assert st == 201, (st, body)
+
+    # 核验：完好 + 共享摘要版本数（只读开放，无需 token）
+    st, _, v = c.verify_package("repair-lib", "1.0.0")
+    show("核验完好包", st, {
+        "status": v["status"], "sha256": v["sha256"][:12] + "…",
+        "shared_version_count": v["shared_version_count"],
+        "shared_versions": [(x["plugin"], x["version"])
+                            for x in v["shared_versions"]]})
+    assert st == 200 and v["status"] == "ok"
+    assert v["shared_version_count"] == 2
+
+    # 用同内容修复一个完好包 -> not_needed，不改写、不动修订
+    st, _, r = c.repair_package("repair-lib", "1.0.0", shared)
+    show("完好包修复（应 not_needed）", st, {"status": r["status"]})
+    assert st == 200 and r["status"] == "not_needed"
+    assert r["affected_version_count"] == 2
+
+    # 摘要不符的替换文件 -> 422 sha256_mismatch，原文件保留
+    st, _, err = c.repair_package("repair-lib", "1.0.0", b"different-bytes")
+    show("修复摘要不符（应 422，原文件保留）", st, err)
+    assert st == 422 and err["detail"]["code"] == "sha256_mismatch"
+
+    # 未知版本 -> 404（核验与修复一致）
+    st, _, _ = c.verify_package("ghost", "1.0.0")
+    assert st == 404
+    st, _, _ = c.repair_package("ghost", "1.0.0", b"x")
+    assert st == 404
+    print("\n核验/修复示例断言通过。")
 
     print("\n全部示例断言通过。")
     return 0

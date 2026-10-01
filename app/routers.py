@@ -24,8 +24,9 @@ from .config import settings
 from .database import get_db
 from .models import CatalogRevision, Plugin, PluginVersion, PublishBatch, Solution
 from .schemas import (
-    BatchOut, PreviewOut, PreviewRequest, PublishMetadata, RevisionOut,
-    RevokeIn, SolutionOut, SolveRequest, VersionOut, validate_batch_id,
+    BatchOut, PackageRepairOut, PackageVerifyOut, PreviewOut, PreviewRequest,
+    PublishMetadata, RevisionOut, RevokeIn, SolutionOut, SolveRequest,
+    VersionOut, validate_batch_id,
 )
 from .service import RequestError, SolutionNotFound, annotate_revoked
 from .solver import CycleError, UnsatisfiableError
@@ -492,14 +493,135 @@ def download(plugin_name: str, version: str, db: Session = Depends(get_db)):
         select(PluginVersion).join(Plugin, Plugin.id == PluginVersion.plugin_id)
         .where(Plugin.name == plugin_name, PluginVersion.version == version)
     ).scalar_one_or_none()
-    if pv is None or not os.path.exists(pv.storage_path):
+    if pv is None:
         raise HTTPException(404, "安装包不存在")
+    # 下载前复核内容：缺失/损坏的包绝不能作为成功下载返回，
+    # 也不能返回半截写入内容（修复期内容寻址文件由 os.replace 原子切换）。
+    status, _size, _actual = catalog.inspect_package_file(pv.storage_path, pv.sha256)
+    if status == catalog.STATUS_MISSING:
+        raise HTTPException(status_code=404, detail={
+            "detail": "安装包文件缺失，请通过修复接口提交替换文件",
+            "code": "package_missing",
+            "plugin": plugin_name, "version": version, "sha256": pv.sha256})
+    if status == catalog.STATUS_CORRUPT:
+        raise HTTPException(status_code=409, detail={
+            "detail": "安装包文件损坏（SHA-256 与记录不一致），请通过修复接口提交替换文件",
+            "code": "package_corrupt",
+            "plugin": plugin_name, "version": version,
+            "sha256": pv.sha256, "actual_sha256": _actual})
     return FileResponse(
         pv.storage_path, filename=pv.filename,
         headers={
             "X-SHA256": pv.sha256,
             "X-Revoked": "true" if pv.revoked_revision else "false",
         },
+    )
+
+
+# ------------------------------------------------------------ 包核验与修复
+
+def _shared_version_out(db: Session, sha256: str):
+    """读取共享该摘要的全部版本（确定序），供核验/修复响应复用。"""
+    items = []
+    for name, ver, is_revoked in repository.versions_with_sha256(db, sha256):
+        items.append({
+            "plugin": name, "version": ver, "revoked": is_revoked,
+            "package_url": f"/api/v1/plugins/{name}/versions/{ver}/download",
+        })
+    return items
+
+
+@router.get("/plugins/{plugin_name}/versions/{version}/verify",
+            response_model=PackageVerifyOut, tags=["catalog"])
+def verify_package(plugin_name: str, version: str, db: Session = Depends(get_db)):
+    """按插件名与版本核验长期保存的安装包（只读，始终开放，含已撤销版本）。
+
+    返回记录的 SHA-256、文件状态（``ok``/``missing``/``corrupt``）以及
+    共享该摘要的版本数；不修改任何版本元数据、目录修订与历史方案。
+    """
+    pv = repository.get_version_row(db, plugin_name, version)
+    if pv is None:
+        raise HTTPException(404, f"未找到 {plugin_name}=={version}")
+    status, size, actual = catalog.inspect_package_file(pv.storage_path, pv.sha256)
+    shared = _shared_version_out(db, pv.sha256)
+    return PackageVerifyOut(
+        plugin=plugin_name,
+        version=version,
+        sha256=pv.sha256,
+        status=status,
+        size_bytes=size,
+        actual_sha256=actual,
+        revoked=pv.revoked_revision is not None,
+        package_url=f"/api/v1/plugins/{plugin_name}/versions/{version}/download",
+        shared_version_count=len(shared),
+        shared_versions=shared,
+    )
+
+
+@router.post("/plugins/{plugin_name}/versions/{version}/repair",
+             response_model=PackageRepairOut, tags=["publish"])
+async def repair_package(
+    plugin_name: str,
+    version: str,
+    package: UploadFile = File(..., description="替换安装包（摘要必须与原记录一致）"),
+    db: Session = Depends(get_db),
+    authorization: str | None = Header(default=None),
+):
+    """提交替换文件原子修复缺失/损坏的安装包（写接口，沿用 API_TOKEN 规则）。
+
+    * 服务端重新计算 SHA-256：与该版本**原记录摘要**不符 → 422 拒绝，
+      不落盘、不改写、原文件保留；
+    * 文件本就完好 → ``not_needed``，绝不改写；
+    * 缺失/损坏 → 同内容寻址文件原子替换，``repaired``；共享该摘要的
+      其它版本随之恢复可下载，响应给出受影响版本数；
+    * 写盘失败 → 507 明确拒绝，原缺失/损坏文件保留；
+    * 不写数据库：版本元数据、目录修订与历史方案均不改变。
+    """
+    _check_token(authorization)
+    pv = repository.get_version_row(db, plugin_name, version)
+    if pv is None:
+        raise HTTPException(404, f"未找到 {plugin_name}=={version}")
+
+    fd, tmp_path = tempfile.mkstemp(prefix="repair-", suffix=".pkg")
+    os.close(fd)
+    try:
+        try:
+            await _stream_upload(package, tmp_path)
+        finally:
+            await package.close()
+        try:
+            catalog.verify_sha256(tmp_path, pv.sha256)
+        except catalog.PublishError as e:
+            raise HTTPException(status_code=422, detail={
+                "detail": str(e), "code": "sha256_mismatch",
+                "plugin": plugin_name, "version": version,
+                "expected_sha256": pv.sha256})
+        try:
+            result, size = catalog.repair_package_atomic(
+                tmp_path, pv.sha256, pv.storage_path)
+        except catalog.RepairStorageError as e:
+            raise HTTPException(status_code=507, detail={
+                "detail": f"修复写盘失败，原文件已保留: {e}",
+                "code": "repair_storage_failed",
+                "plugin": plugin_name, "version": version,
+                "sha256": pv.sha256})
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    shared = _shared_version_out(db, pv.sha256)
+    return PackageRepairOut(
+        plugin=plugin_name,
+        version=version,
+        sha256=pv.sha256,
+        status=result,
+        size_bytes=size,
+        package_url=f"/api/v1/plugins/{plugin_name}/versions/{version}/download",
+        affected_version_count=len(shared),
+        shared_versions=shared,
     )
 
 

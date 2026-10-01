@@ -431,6 +431,72 @@ class MemoryFlowTests(unittest.TestCase):
         self.assertEqual(self.db.revisions, [])
         self.assertNotIn("badsha", self.db.batches)
 
+    # ------------------------------------------------------------ 包核验与修复
+    def test_inspect_package_file_statuses(self):
+        good = b"good-bytes"
+        sha = hashlib.sha256(good).hexdigest()
+        p = os.path.join(self.pkgdir, "p.bin")
+        self.assertEqual(catalog.inspect_package_file(p, sha)[0],
+                         catalog.STATUS_MISSING)
+        with open(p, "wb") as f:
+            f.write(good)
+        status, size, actual = catalog.inspect_package_file(p, sha)
+        self.assertEqual((status, size, actual),
+                         (catalog.STATUS_OK, len(good), sha))
+        with open(p, "wb") as f:
+            f.write(b"corrupt-bytes")
+        status, size, actual = catalog.inspect_package_file(p, sha)
+        self.assertEqual(status, catalog.STATUS_CORRUPT)
+        self.assertEqual(actual, hashlib.sha256(b"corrupt-bytes").hexdigest())
+        self.assertEqual(size, len(b"corrupt-bytes"))
+
+    def test_repair_missing_and_corrupt_is_atomic_and_idempotent(self):
+        content = b"repair-content"
+        sha = hashlib.sha256(content).hexdigest()
+        target = os.path.join(self.pkgdir, sha[:2], sha)
+
+        # 缺失 -> 原子修复（硬链接路径，源文件保留）
+        src = os.path.join(self.pkgdir, "src1.bin")
+        with open(src, "wb") as f:
+            f.write(content)
+        result, size = catalog.repair_package_atomic(src, sha, target)
+        self.assertEqual((result, size), (catalog.REPAIR_REPAIRED, len(content)))
+        self.assertEqual(open(target, "rb").read(), content)
+        self.assertTrue(os.path.exists(src))
+
+        # 完好再修 -> not_needed，不改写（mtime/inode 不变）
+        st = os.stat(target)
+        src2 = os.path.join(self.pkgdir, "src2.bin")
+        with open(src2, "wb") as f:
+            f.write(content)
+        result, _ = catalog.repair_package_atomic(src2, sha, target)
+        self.assertEqual(result, catalog.REPAIR_NOT_NEEDED)
+        self.assertEqual(os.stat(target).st_ino, st.st_ino)
+
+        # 损坏 -> 原子替换为正确内容
+        with open(target, "wb") as f:
+            f.write(b"CORRUPT")
+        src3 = os.path.join(self.pkgdir, "src3.bin")
+        with open(src3, "wb") as f:
+            f.write(content)
+        result, size = catalog.repair_package_atomic(src3, sha, target)
+        self.assertEqual(result, catalog.REPAIR_REPAIRED)
+        self.assertEqual(open(target, "rb").read(), content)
+
+        # 不产生残留临时文件
+        leftovers = [n for n in os.listdir(os.path.dirname(target))
+                     if n.startswith((".tmp-", ".repair-"))]
+        self.assertEqual(leftovers, [])
+
+    def test_repair_rejects_wrong_digest_at_caller(self):
+        # 修复前置复核沿用 verify_sha256：摘要不符不得调用替换
+        content = b"actual"
+        src = os.path.join(self.pkgdir, "src.bin")
+        with open(src, "wb") as f:
+            f.write(content)
+        with self.assertRaises(catalog.PublishError):
+            catalog.verify_sha256(src, "0" * 64)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

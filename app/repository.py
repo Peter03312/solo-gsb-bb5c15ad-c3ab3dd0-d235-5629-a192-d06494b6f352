@@ -88,6 +88,35 @@ def _existing_version(db: Any, plugin, version: str):
     ).scalar_one_or_none()
 
 
+def get_version_row(db: Any, plugin_name: str, version: str):
+    """按已发布插件名+版本读取版本行（含已撤销版本）；不存在返回 None。"""
+    o = _orm()
+    return db.execute(
+        o.select(o.PluginVersion).join(
+            o.Plugin, o.Plugin.id == o.PluginVersion.plugin_id)
+        .where(o.Plugin.name == plugin_name,
+               o.PluginVersion.version == version)
+    ).scalar_one_or_none()
+
+
+def versions_with_sha256(db: Any, sha256: str) -> list[tuple[str, str, bool]]:
+    """返回所有记录了同一 SHA-256 摘要的 ``(插件名, 版本, 是否已撤销)``。
+
+    内容寻址存储下这些版本共享同一个包文件：修复一次即全部恢复可下载。
+    按 (插件名, 版本) 确定序排列。
+    """
+    o = _orm()
+    rows = db.execute(
+        o.select(o.Plugin.name, o.PluginVersion.version,
+                 o.PluginVersion.revoked_revision)
+        .join(o.Plugin, o.Plugin.id == o.PluginVersion.plugin_id)
+        .where(o.PluginVersion.sha256 == sha256.lower())
+        .order_by(o.Plugin.name, o.PluginVersion.version)
+    ).all()
+    return [(name, ver, revoked_rev is not None)
+            for name, ver, revoked_rev in rows]
+
+
 def _insert_version(db: Any, *, plugin, metadata, sha256: str,
                     original_filename: str, storage_path: str, size: int,
                     revision_no: int):

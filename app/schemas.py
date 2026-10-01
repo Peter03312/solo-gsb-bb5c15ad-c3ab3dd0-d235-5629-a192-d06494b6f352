@@ -249,3 +249,39 @@ class BatchOut(BaseModel):
 class OkOut(BaseModel):
     ok: bool = True
     message: str
+
+
+# ----------------------------------------------------------- 包核验与修复
+
+class SharedVersionOut(BaseModel):
+    """共享同一 SHA-256 摘要（即同一内容寻址包文件）的某个版本。"""
+    plugin: str
+    version: str
+    revoked: bool = False
+    package_url: str
+
+
+class PackageVerifyOut(BaseModel):
+    """按插件名+版本核验长期保存的安装包文件（只读，始终开放）。"""
+    plugin: str
+    version: str
+    sha256: str                       # 记录的 SHA-256
+    status: str                       # ok / missing / corrupt
+    size_bytes: int | None = None     # 磁盘文件实际字节数（缺失为 null）
+    actual_sha256: str | None = None  # 实际摘要（完好即记录摘要；缺失为 null）
+    revoked: bool = False
+    package_url: str
+    shared_version_count: int
+    shared_versions: list[SharedVersionOut]
+
+
+class PackageRepairOut(BaseModel):
+    """提交替换文件修复缺失/损坏包的结果（写接口，沿用 API_TOKEN 规则）。"""
+    plugin: str
+    version: str
+    sha256: str
+    status: str                       # repaired / not_needed
+    size_bytes: int
+    package_url: str
+    affected_version_count: int       # 共享该摘要、随之一并恢复的版本数
+    shared_versions: list[SharedVersionOut]

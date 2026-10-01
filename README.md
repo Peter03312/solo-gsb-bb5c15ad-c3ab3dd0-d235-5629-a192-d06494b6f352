@@ -57,7 +57,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `plugindb` | 数据库凭据 |
 | `PACKAGE_DIR` | `/data/packages` | 安装包内容寻址存储根目录（按 sha256 前两位分桶） |
 | `MAX_UPLOAD_BYTES` | `1073741824`（1 GiB） | 单次上传大小上限 |
-| `API_TOKEN` | 空 | 非空时写接口（单版本发布/批次发布/撤销/求解）要求 `Authorization: Bearer <token>`；读接口（含批次查询）始终开放 |
+| `API_TOKEN` | 空 | 非空时写接口（单版本发布/批次发布/撤销/求解/包修复）要求 `Authorization: Bearer <token>`；读接口（含批次查询、包核验）始终开放 |
 | `API_PORT` | `8080` | 宿主机映射端口（compose） |
 
 ---
@@ -150,6 +150,53 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 行为对其一视同仁，无需任何改动。响应中 `members` 按 (插件名, 版本)
 **确定性排序**（与提交顺序无关，重试结果逐字节一致），每项含独立的
 `package_url` 与撤销标记，可直接逐项下载。
+
+### 安装包核验与修复（长期保存丢失/损坏）
+
+实验室长期保存的安装包可能**丢失或损坏**，但版本记录（SHA-256、元数据、
+修订）仍然可信。提供两个接口：核验沿用读接口开放规则；修复沿用写接口
+`API_TOKEN` 规则。**二者都不改变版本元数据、目录修订与历史方案。**
+
+`GET /api/v1/plugins/{name}/versions/{ver}/verify`（只读，始终开放，**含已撤销版本**）
+
+按已发布的插件名与版本核验内容寻址包文件，返回：
+
+- `sha256`：版本记录的 SHA-256；
+- `status`：`ok`（完好，文件存在且摘要一致）/ `missing`（文件缺失）/
+  `corrupt`（文件存在但摘要与记录不一致），另带磁盘实际字节数
+  `size_bytes` 与 `actual_sha256`（缺失时二者为 `null`）；
+- `shared_version_count` 与 `shared_versions`：**共享该摘要的版本数及
+  版本清单**（含各自撤销标记与下载地址）——内容寻址存储下它们共享同一个
+  包文件；
+- 未知版本 → **404**。
+
+`POST /api/v1/plugins/{name}/versions/{ver}/repair`（multipart：`package`，写接口）
+
+提交一个替换文件修复缺失/损坏的包：
+
+- 服务端流式接收并**重新计算 SHA-256**：与该版本**原记录摘要**不符 →
+  **422 `sha256_mismatch` 明确拒绝**，不落盘、不改写，**原缺失/损坏
+  文件保留**；
+- 文件本就完好 → `status="not_needed"`，**完好包绝不改写**（无新修订）；
+- 缺失/损坏 → 以同内容寻址路径**原子替换**（先尝试不覆盖的硬链接占位，
+  跨文件系统回退为同目录临时文件 + `os.replace`），替换后复核摘要，
+  `status="repaired"`；
+- **同摘要的其它版本随之恢复可下载**，响应给出 `affected_version_count`
+  与版本清单；
+- **写盘失败 → 507 `repair_storage_failed` 明确拒绝并保留原文件**
+  （缺失仍缺失、损坏文件不被半截内容覆盖），不遗留临时文件；
+- 与同摘要的发布/下载/另一修复并发时：**不覆盖任何已确认完好的文件**，
+  竞争落败的一方返回 `not_needed`；下载在替换窗口内只会读到完整旧文件
+  或完整新文件（或明确的 404/409），**绝不返回部分写入内容**；只有一个
+  请求完成替换，其余返回 `not_needed`。
+
+下载接口（`…/download`）在发送前复核内容并保持既有兼容：
+
+- 成功下载仍返回原内容，响应头 `X-SHA256`（记录摘要）与
+  `X-Revoked`（`true`/`false`）不变；
+- 包**缺失 → 404 `package_missing`**、**损坏 → 409 `package_corrupt`**
+  （结构化 `detail`，含记录摘要与实际摘要）；缺失或损坏的包**绝不作为
+  成功下载返回**。
 
 ### 求解
 
@@ -282,7 +329,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 | GET  | `/revisions/{id}` | 单个修订 |
 | GET  | `/plugins?revision=N` | 插件与版本清单（默认最新修订，仅未撤销） |
 | GET  | `/plugins/{name}/versions/{ver}` | 版本详情（含撤销状态） |
-| GET  | `/plugins/{name}/versions/{ver}/download` | 下载安装包（响应头 `X-SHA256`、`X-Revoked`） |
+| GET  | `/plugins/{name}/versions/{ver}/verify` | 核验安装包：记录 SHA-256、`ok`/`missing`/`corrupt`、共享摘要版本数（只读开放，含已撤销版本） |
+| POST | `/plugins/{name}/versions/{ver}/repair` | 提交替换文件原子修复缺失/损坏包（写接口，同摘要版本一并恢复） |
+| GET  | `/plugins/{name}/versions/{ver}/download` | 下载安装包（响应头 `X-SHA256`、`X-Revoked`；缺失 404/损坏 409） |
 | GET  | `/health` | 健康检查（不带前缀） |
 
 错误响应统一为 `{"detail": ...}`；求解失败时 `detail` 为：
@@ -360,6 +409,17 @@ curl -X POST http://localhost:8080/api/v1/solutions/7/preview \
   -H 'Content-Type: application/json' \
   -d '{"revision":12,
        "runtimes":[{"name":"python","spec":"3.12.*"}]}'
+
+# 核验长期保存的安装包（只读开放；status: ok/missing/corrupt，含共享摘要版本数）
+curl http://localhost:8080/api/v1/plugins/data-toolkit/versions/3.0.0/verify
+
+# 包缺失/损坏后，用“同一内容”的替换文件原子修复（写接口；启用 API_TOKEN 时带 -H）
+# 服务端按版本原记录的 SHA-256 复核；摘要不符 -> 422 且原文件保留
+curl -X POST http://localhost:8080/api/v1/plugins/data-toolkit/versions/3.0.0/repair \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -F "package=@/tmp/dtk.bin"
+# -> {"status":"repaired","affected_version_count":N,"shared_versions":[...]}
+# 完好包再次修复 -> {"status":"not_needed",...}，不改写；同摘要其它版本一并恢复
 ```
 
 ---
@@ -370,14 +430,14 @@ curl -X POST http://localhost:8080/api/v1/solutions/7/preview \
 
 ```bash
 python3 tests/test_solver.py        # 30 用例：PEP440、传递依赖、互斥、环、回溯、运行环境、确定性、最小变动预演
-python3 tests/test_catalog_flow.py  # 11 用例：发布校验/不可改写/摘要拒绝/快照/撤销语义/请求哈希/批次原子性与幂等（内存仓储）
+python3 tests/test_catalog_flow.py  # 14 用例：发布校验/不可改写/摘要拒绝/快照/撤销语义/请求哈希/批次原子性与幂等/包核验与原子修复（内存仓储）
 ```
 
 API 端到端测试（需要 FastAPI/SQLAlchemy 环境，可用内存 SQLite，无需起 PostgreSQL）：
 
 ```bash
 pip install -r requirements.txt httpx
-python3 tests/test_api.py          # 37 用例（含 9 个预演端到端用例、14 个批次端到端用例）
+python3 tests/test_api.py          # 44 用例（含 9 个预演端到端用例、14 个批次端到端用例、7 个核验/修复端到端用例）
 ```
 
 覆盖：摘要不符拒绝、非法范围拒绝、同名同版本不可改写、传递求解与缓存、
@@ -388,7 +448,11 @@ python3 tests/test_api.py          # 37 用例（含 9 个预演端到端用例�
 同号异内容 409、批次内重复 409、与既有版本冲突整批不可见、SHA-256/范围
 非法整批拒绝、落盘后失败回滚且孤儿包文件回收（含保留被引用的同哈希文件）、
 成员只在批次修订可见、批次成员撤销、并发同号重试只形成一个修订**、
-与单版本发布/求解/下载交错兼容。
+与单版本发布/求解/下载交错兼容；**核验/修复覆盖完好/缺失/损坏三态与
+共享摘要版本数（含已撤销版本）、缺失 404/损坏 409 绝不作为成功下载、
+摘要不符 422 保留原文件、原子修复后同摘要版本一并恢复且不改元数据/修订、
+完好包 not_needed 不改写、写盘失败 507 保留现场、API_TOKEN 读写鉴权、
+并发修复只有一次替换且下载不返回部分写入内容**。
 
 ---
 
@@ -403,7 +467,7 @@ app/
   schemas.py     # Pydantic 请求/响应模型与入参校验
   version.py     # PEP 440 版本与范围（标准库实现，无第三方依赖）
   solver.py      # 确定性回溯求解器（MRV + 冲突回溯 + 环检测）与最小变动预演、逐插件差异
-  catalog.py     # 纯领域逻辑：发布校验、SHA-256、请求/批次规范化哈希、失败孤儿回收
+  catalog.py     # 纯领域逻辑：发布校验、SHA-256、请求/批次规范化哈希、失败孤儿回收、包文件核验与原子修复
   repository.py  # ORM 持久化：发布/批次/撤销事务、修订快照、方案存取
   service.py     # 求解编排与预演编排：覆盖合并、缓存、序列化、撤销标记
   routers.py     # HTTP 路由（PostgreSQL REPEATABLE READ 只读快照事务）
@@ -440,3 +504,12 @@ docker-compose.yml  Dockerfile  requirements.txt
   在旧修订号上的历史预演结果。最小变动目标通过对同一确定性 DFS 的
   分支定界枚举实现：以原方案版本为基线最小化新增/移除/换版数，平手保留
   确定性 DFS 找到的第一个完整方案。
+- **包核验/修复不触碰数据库写路径**：核验只读文件系统与版本行；修复只
+  替换内容寻址文件（路径即 `PACKAGE_DIR/<sha前2位>/<sha>`），不新增修订、
+  不改版本行、不改历史方案，因此同摘要的所有版本天然一并恢复。修复先用
+  **硬链接占位**（`link` 是不覆盖的原子 create）：目标已存在且完好即
+  `not_needed`，绝不覆盖；跨文件系统等不支持链接时回退到
+  同目录临时文件 + `os.replace` 原子重命名，替换后复核摘要，写盘失败
+  抛错并保留原文件。下载在发送前 `inspect`（存在性 + 流式 SHA-256），
+  缺失/损坏明确 404/409，故修复切换窗口内读者只会看到完整旧文件或完整
+  新文件，绝不读到半截写入内容。
