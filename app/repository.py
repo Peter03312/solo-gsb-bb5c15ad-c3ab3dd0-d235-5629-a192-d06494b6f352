@@ -286,6 +286,75 @@ def publish_batch(db: Any, *, batch_id: str, items: list, package_dir: str,
         created_paths=created_paths, batch_row=batch_row)
 
 
+# ------------------------------------------------------------ 核验与修复
+
+def get_version_row(db: Any, plugin_name: str, version: str):
+    """按 (插件名, 版本) 取版本行（含已撤销）；不存在返回 None。"""
+    o = _orm()
+    return db.execute(
+        o.select(o.PluginVersion)
+        .join(o.Plugin, o.Plugin.id == o.PluginVersion.plugin_id)
+        .where(o.Plugin.name == plugin_name, o.PluginVersion.version == version)
+    ).scalar_one_or_none()
+
+
+def versions_with_sha(db: Any, sha256: str):
+    """所有记录了同一 SHA-256 的版本行（含已撤销、跨插件、跨版本）。
+
+    内容寻址存储下这些行本就共享同一个物理文件；一个文件被修复，
+    全部版本同时恢复可下载。
+    """
+    o = _orm()
+    return list(db.execute(
+        o.select(o.PluginVersion, o.Plugin.name)
+        .join(o.Plugin, o.Plugin.id == o.PluginVersion.plugin_id)
+        .where(o.PluginVersion.sha256 == sha256)
+        .order_by(o.Plugin.name, o.PluginVersion.version)
+    ).all())
+
+
+def iter_all_version_rows(db: Any, plugin_name: str | None = None):
+    """枚举版本行（含已撤销）用于全量核验；可按插件名过滤。"""
+    o = _orm()
+    stmt = (
+        o.select(o.PluginVersion, o.Plugin.name)
+        .join(o.Plugin, o.Plugin.id == o.PluginVersion.plugin_id)
+    )
+    if plugin_name is not None:
+        stmt = stmt.where(o.Plugin.name == plugin_name)
+    stmt = stmt.order_by(o.Plugin.name, o.PluginVersion.version)
+    return list(db.execute(stmt).all())
+
+
+def shared_sha_counts(db: Any, sha_values: Iterable[str]) -> dict[str, int]:
+    """一次性统计给定摘要集合各自对应的版本行数（共享该摘要的版本数）。"""
+    values = list(set(sha_values))
+    if not values:
+        return {}
+    o = _orm()
+    rows = db.execute(
+        o.select(o.PluginVersion.sha256, o.func.count())
+        .where(o.PluginVersion.sha256.in_(values))
+        .group_by(o.PluginVersion.sha256)
+    ).all()
+    return {sha: count for sha, count in rows}
+
+
+def repair_package(db: Any, *, pv, src_path: str, package_dir: str):
+    """按版本行记录的 SHA-256 原子修复其内容寻址文件（纯文件操作）。
+
+    * 不写数据库、不产生目录修订、不改版本元数据与历史方案；
+    * 摘要与原记录不符由调用方先用 :func:`catalog.verify_sha256` 拒绝，
+      本函数在摘要排他锁内复检状态后原子替换，完好文件不改写；
+    * 同摘要的其他版本共享同一物理文件，修复后一并恢复。
+
+    返回 :class:`catalog.InstallResult`（含修复前状态与是否实际替换）。
+    """
+    return catalog.install_package_atomic(
+        src_path, pv.sha256, package_dir,
+        replace_corrupt=True, final_path=pv.storage_path)
+
+
 def revoke_version(db: Any, *, plugin_name: str, version: str,
                    reason: str | None) -> int:
     o = _orm()

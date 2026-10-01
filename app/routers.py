@@ -9,12 +9,13 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
@@ -24,8 +25,10 @@ from .config import settings
 from .database import get_db
 from .models import CatalogRevision, Plugin, PluginVersion, PublishBatch, Solution
 from .schemas import (
-    BatchOut, PreviewOut, PreviewRequest, PublishMetadata, RevisionOut,
-    RevokeIn, SolutionOut, SolveRequest, VersionOut, validate_batch_id,
+    BatchOut, PackageAuditOut, PackageAuditItem, PackageRepairOut,
+    PackageVerifyOut, PackageVersionRef, PreviewOut, PreviewRequest,
+    PublishMetadata, RevisionOut, RevokeIn, SolutionOut, SolveRequest,
+    VersionOut, validate_batch_id,
 )
 from .service import RequestError, SolutionNotFound, annotate_revoked
 from .solver import CycleError, UnsatisfiableError
@@ -392,7 +395,6 @@ def _garbage_collect(db: Session, created_paths: list[str]) -> None:
 
 
 def _batch_response(db: Session, outcome, *, status_code: int):
-    from fastapi.responses import JSONResponse
     members = []
     for idx, (name, version, pv) in enumerate(outcome.members, start=1):
         members.append({
@@ -488,19 +490,202 @@ def get_version(plugin_name: str, version: str, db: Session = Depends(get_db)):
 @router.get("/plugins/{plugin_name}/versions/{version}/download",
             tags=["catalog"], include_in_schema=True)
 def download(plugin_name: str, version: str, db: Session = Depends(get_db)):
-    pv = db.execute(
-        select(PluginVersion).join(Plugin, Plugin.id == PluginVersion.plugin_id)
-        .where(Plugin.name == plugin_name, PluginVersion.version == version)
-    ).scalar_one_or_none()
-    if pv is None or not os.path.exists(pv.storage_path):
-        raise HTTPException(404, "安装包不存在")
+    """下载安装包：缺失或损坏（SHA-256 不符）一律不作为成功下载返回。
+
+    响应头始终携带 ``X-SHA256``（记录摘要）与 ``X-Revoked``（撤销标记），
+    兼容既有客户端；原子修复替换期间只可能取到旧文件或完整新文件，
+    绝不会读到部分写入。
+    """
+    pv = _require_version(db, plugin_name, version)
+    report = catalog.inspect_package(pv.storage_path, pv.sha256)
+    headers = _package_headers(pv)
+    if report["state"] == catalog.STATE_MISSING:
+        raise HTTPException(status_code=404, headers=headers, detail={
+            "detail": "安装包文件缺失，请提交原摘要的安装包进行修复",
+            "code": "package_missing",
+            "plugin": plugin_name, "version": version,
+            "sha256": pv.sha256, "revoked": pv.revoked_revision is not None,
+        })
+    if report["state"] == catalog.STATE_CORRUPT:
+        raise HTTPException(status_code=404, headers=headers, detail={
+            "detail": "安装包已损坏（SHA-256 与记录不符），拒绝下载，"
+                      "请提交原摘要的安装包进行修复",
+            "code": "package_corrupt",
+            "plugin": plugin_name, "version": version,
+            "expected_sha256": pv.sha256,
+            "actual_sha256": report["actual_sha256"],
+            "revoked": pv.revoked_revision is not None,
+        })
     return FileResponse(
-        pv.storage_path, filename=pv.filename,
-        headers={
-            "X-SHA256": pv.sha256,
-            "X-Revoked": "true" if pv.revoked_revision else "false",
-        },
+        pv.storage_path, filename=pv.filename, headers=headers,
     )
+
+
+# ------------------------------------------------------------ 核验与修复
+
+def _require_version(db: Session, plugin_name: str, version: str) -> PluginVersion:
+    pv = repository.get_version_row(db, plugin_name, version)
+    if pv is None:
+        raise HTTPException(404, f"未找到 {plugin_name}=={version}")
+    return pv
+
+
+def _package_headers(pv: PluginVersion) -> dict[str, str]:
+    return {
+        "X-SHA256": pv.sha256,
+        "X-Revoked": "true" if pv.revoked_revision else "false",
+    }
+
+
+def _package_url(plugin_name: str, version: str) -> str:
+    return f"/api/v1/plugins/{plugin_name}/versions/{version}/download"
+
+
+def _shared_refs(db: Session, sha256: str) -> list[PackageVersionRef]:
+    rows = repository.versions_with_sha(db, sha256)
+    return [PackageVersionRef(
+        plugin=name, version=pv.version,
+        revoked=pv.revoked_revision is not None)
+        for pv, name in rows]
+
+
+@router.get("/plugins/{plugin_name}/versions/{version}/verify",
+            response_model=PackageVerifyOut, tags=["maintenance"])
+def verify_package(plugin_name: str, version: str, db: Session = Depends(get_db)):
+    """按已发布插件名+版本核验安装包（只读，沿用读接口开放规则）。
+
+    返回记录的 SHA-256、文件状态（``intact`` / ``missing`` / ``corrupt``）
+    以及共享该摘要的版本数与清单；**已撤销版本同样可核验**。
+    """
+    pv = _require_version(db, plugin_name, version)
+    report = catalog.inspect_package(pv.storage_path, pv.sha256)
+    refs = _shared_refs(db, pv.sha256)
+    return PackageVerifyOut(
+        plugin=plugin_name, version=version, sha256=pv.sha256,
+        state=report["state"], actual_sha256=report["actual_sha256"],
+        size_bytes=report["size_bytes"],
+        revoked=pv.revoked_revision is not None,
+        package_url=_package_url(plugin_name, version),
+        shared_version_count=len(refs), shared_versions=refs,
+    )
+
+
+@router.post("/plugins/{plugin_name}/versions/{version}/repair",
+             response_model=PackageRepairOut, tags=["maintenance"])
+async def repair_package(
+    plugin_name: str,
+    version: str,
+    package: UploadFile = File(..., description="替换用安装包（SHA-256 必须与原记录一致）"),
+    db: Session = Depends(get_db),
+    authorization: str | None = Header(default=None),
+):
+    """提交替换文件原子修复缺失/损坏的安装包（写接口，沿用 API_TOKEN 规则）。
+
+    * 未知版本 → 404；上传文件摘要与原记录不符 → 422 明确拒绝、**原文件保留**；
+    * 目标完好 → 不改写，返回 ``result=intact``（无需修复）；
+    * 缺失/损坏 → 在同摘要排他锁内复检并 ``os.replace`` 原子切换，
+      返回 ``result=repaired`` 及受影响（同摘要）版本数；
+    * 写盘失败 → 500、保留原文件；
+    * 不产生目录修订、不改版本元数据与历史方案；同摘要其他版本随即恢复下载。
+    """
+    _check_token(authorization)
+    pv = _require_version(db, plugin_name, version)
+
+    # 流式落临时文件并限制大小（与发布一致）
+    fd, tmp_path = tempfile.mkstemp(prefix="repair-", suffix=".pkg")
+    try:
+        try:
+            size = 0
+            with os.fdopen(fd, "wb") as out:
+                while True:
+                    chunk = await package.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > settings.max_upload_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"安装包超过上限 {settings.max_upload_bytes} 字节")
+                    out.write(chunk)
+        finally:
+            await package.close()
+
+        # 摘要不符：明确拒绝且保留原文件（临时文件在 finally 清理）
+        try:
+            catalog.verify_sha256(tmp_path, pv.sha256)
+        except catalog.PublishError as e:
+            raise HTTPException(status_code=422, detail={
+                "detail": str(e), "code": "sha256_mismatch",
+                "plugin": plugin_name, "version": version,
+                "expected_sha256": pv.sha256,
+            })
+
+        try:
+            result = repository.repair_package(
+                db, pv=pv, src_path=tmp_path,
+                package_dir=settings.package_dir)
+        except catalog.RepairStorageError as e:
+            raise HTTPException(status_code=500, detail={
+                "detail": str(e), "code": "repair_write_failed",
+                "plugin": plugin_name, "version": version,
+            })
+    finally:
+        if os.path.exists(tmp_path):
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+
+    refs = _shared_refs(db, pv.sha256)
+    return PackageRepairOut(
+        plugin=plugin_name, version=version, sha256=pv.sha256,
+        result="repaired" if result.repaired else "intact",
+        previous_state=result.pre_state, size_bytes=result.size,
+        package_url=_package_url(plugin_name, version),
+        affected_version_count=len(refs), affected_versions=refs,
+    )
+
+
+@router.get("/packages", response_model=PackageAuditOut, tags=["maintenance"])
+def audit_packages(
+    status: str | None = Query(
+        default=None,
+        description="只返回该状态：intact / missing / corrupt；省略返回全部"),
+    plugin: str | None = Query(default=None, description="只核验该插件名下版本"),
+    db: Session = Depends(get_db),
+):
+    """批量核验全部已发布版本（只读开放；含已撤销版本）。
+
+    便于长期保存后巡检；可按 ``status``（intact/missing/corrupt）与
+    ``plugin`` 过滤。``shared_version_count`` 为共享该摘要的版本数。
+    """
+    if status is not None and status not in (
+            catalog.STATE_OK, catalog.STATE_MISSING, catalog.STATE_CORRUPT):
+        raise HTTPException(status_code=400, detail={
+            "detail": "status 只允许 intact / missing / corrupt",
+            "code": "invalid_status_filter"})
+
+    rows = repository.iter_all_version_rows(db, plugin)
+    sha_counts = repository.shared_sha_counts(db, [pv.sha256 for pv, _ in rows])
+    counts = {catalog.STATE_OK: 0, catalog.STATE_MISSING: 0,
+              catalog.STATE_CORRUPT: 0}
+    items: list[PackageAuditItem] = []
+    for pv, name in rows:
+        report = catalog.inspect_package(pv.storage_path, pv.sha256)
+        state = report["state"]
+        counts[state] += 1
+        if status is not None and state != status:
+            continue
+        items.append(PackageAuditItem(
+            plugin=name, version=pv.version, sha256=pv.sha256,
+            state=state, actual_sha256=report["actual_sha256"],
+            size_bytes=report["size_bytes"],
+            revoked=pv.revoked_revision is not None,
+            shared_version_count=sha_counts.get(pv.sha256, 0),
+            package_url=_package_url(name, pv.version),
+        ))
+    return PackageAuditOut(
+        total=len(rows), intact=counts[catalog.STATE_OK],
+        missing=counts[catalog.STATE_MISSING],
+        corrupt=counts[catalog.STATE_CORRUPT], items=items)
 
 
 # ------------------------------------------------------------ 求解

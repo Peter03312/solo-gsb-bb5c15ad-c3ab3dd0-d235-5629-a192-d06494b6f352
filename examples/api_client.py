@@ -102,6 +102,51 @@ class Client:
     def batch(self, batch_id: str):
         return self._request("GET", f"/batches/{batch_id}")
 
+    # ------------------------------------------------------------ 核验与修复
+    def verify(self, plugin: str, version: str):
+        return self._request(
+            "GET", f"/plugins/{plugin}/versions/{version}/verify")
+
+    def audit_packages(self, status: str | None = None, plugin: str | None = None):
+        qs = []
+        if status:
+            qs.append(f"status={status}")
+        if plugin:
+            qs.append(f"plugin={plugin}")
+        suffix = ("?" + "&".join(qs)) if qs else ""
+        return self._request("GET", f"/packages{suffix}")
+
+    def repair(self, plugin: str, version: str, payload: bytes):
+        """提交同摘要安装包原子修复（multipart，写接口，随客户端带 Token）。"""
+        boundary = "----labrepair" + uuid.uuid4().hex
+        buf = io.BytesIO()
+        buf.write(f"--{boundary}\r\n".encode())
+        buf.write(
+            b'Content-Disposition: form-data; name="package"; '
+            b'filename="replacement.bin"\r\n'
+            b"Content-Type: application/octet-stream\r\n\r\n")
+        buf.write(payload)
+        buf.write(f"\r\n--{boundary}--\r\n".encode())
+        return self._request(
+            "POST", f"/plugins/{plugin}/versions/{version}/repair",
+            data=buf.getvalue(),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+    def download(self, plugin: str, version: str):
+        url = self.base + f"/plugins/{plugin}/versions/{version}/download"
+        req = urllib.request.Request(url, method="GET")
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                return e.code, dict(e.headers), json.loads(raw)
+            except json.JSONDecodeError:
+                return e.code, dict(e.headers), raw
+
     def solve(self, req: dict):
         return self._request("POST", "/solutions", data=req)
 
@@ -308,6 +353,41 @@ def main() -> int:
     show("批次内重复成员（409）", st, berr)
     assert st == 409
 
+    # ------------------------------------------------------------ 核验与修复
+    # alpha 2.0.0 的包此前已发布（与撤销无关——已撤销版本仍可核验）。
+    st, _, v = c.verify("alpha", "2.0.0")
+    show("核验已撤销版本 alpha==2.0.0", st, {
+        "state": v["state"], "sha256": v["sha256"],
+        "shared_version_count": v["shared_version_count"],
+        "revoked": v["revoked"]})
+    assert st == 200 and v["state"] == "intact" and v["revoked"] is True
+
+    # 全库巡检：全部完好
+    st, _, a = c.audit_packages()
+    show("全库包文件巡检", st, {k: a[k] for k in
+                                ("total", "intact", "missing", "corrupt")})
+    assert st == 200 and a["corrupt"] == 0 and a["missing"] == 0
+
+    # 用同摘要文件修复完好包 -> result=intact（不改写）
+    st, _, rp = c.repair("alpha", "2.0.0", b"alpha2")
+    show("修复完好包（应 intact，无需修复）", st, {
+        "result": rp["result"], "previous_state": rp["previous_state"],
+        "affected_version_count": rp["affected_version_count"]})
+    assert st == 200 and rp["result"] == "intact"
+
+    # 摘要不符 -> 422，原文件保留
+    st, _, err = c.repair("alpha", "2.0.0", b"totally-wrong-content")
+    show("修复摘要不符（应 422 拒绝、原文件保留）", st, err)
+    assert st == 422 and err["detail"]["code"] == "sha256_mismatch"
+
+    # 未知版本 -> 404
+    st, _, err = c.repair("ghost-plugin", "1.0.0", b"x")
+    show("修复未知版本（应 404）", st, err)
+    assert st == 404
+
+    # 损坏/缺失后修复的端到端效果可用独立脚本演示（需要触碰服务器上
+    # PACKAGE_DIR 内的内容寻址文件）：
+    #   bash examples/package-repair-demo.sh
     print("\n全部示例断言通过。")
     return 0
 

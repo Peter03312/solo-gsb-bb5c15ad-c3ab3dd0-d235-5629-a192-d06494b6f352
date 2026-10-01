@@ -9,6 +9,7 @@ PostgreSQL + REPEATABLE READ 事务上，逻辑一致（JSON 字段跨方言兼�
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib
 import io
@@ -131,6 +132,30 @@ class ApiTests(unittest.TestCase):
         import glob
         return [os.path.basename(p) for p in
                 glob.glob(os.path.join(self.pkgdir, "*", "*"))]
+
+    # -------------------------------------------------- 核验 / 修复 helpers
+    def _storage_path(self, plugin, version):
+        from app import repository
+        from app.database import SessionLocal
+        db = SessionLocal()
+        try:
+            pv = repository.get_version_row(db, plugin, version)
+            self.assertIsNotNone(pv)
+            return pv.storage_path
+        finally:
+            db.close()
+
+    def repair_file(self, plugin, version, body, token=True):
+        headers = {"Authorization": "Bearer tkn"} if token else {}
+        files = {"package": ("replacement.bin", io.BytesIO(body),
+                             "application/octet-stream")}
+        return self.client.post(
+            f"/api/v1/plugins/{plugin}/versions/{version}/repair",
+            files=files, headers=headers)
+
+    def verify(self, plugin, version):
+        return self.client.get(
+            f"/api/v1/plugins/{plugin}/versions/{version}/verify")
 
     # ------------------------------------------------------------ tests
     def test_health_and_root(self):
@@ -803,6 +828,218 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/v1/revisions").json()[0]["revision"], 3)
         d = self.client.get("/api/v1/plugins/mix/versions/1.0.0/download")
         self.assertEqual(d.content, b"mix")
+
+
+    # ----------------------------------------------------------- 核验与修复
+    def _publish_two_shared(self):
+        """两个不同插件发布同内容包 -> 共享同一内容寻址文件与 SHA-256。"""
+        body = b"shared-payload"
+        self.publish("sh-a", "1.0.0", body, expect=201)
+        self.publish("sh-b", "1.0.0", body, expect=201)
+        return body, hashlib.sha256(body).hexdigest()
+
+    def test_verify_intact_with_shared_count(self):
+        body, sha = self._publish_two_shared()
+        r = self.verify("sh-a", "1.0.0")
+        self.assertEqual(r.status_code, 200, r.text)
+        body_j = r.json()
+        self.assertEqual(body_j["state"], "intact")
+        self.assertEqual(body_j["sha256"], sha)
+        # 完好时实际摘要即记录摘要
+        self.assertEqual(body_j["actual_sha256"], sha)
+        self.assertEqual(body_j["size_bytes"], len(body))
+        self.assertFalse(body_j["revoked"])
+        self.assertEqual(body_j["shared_version_count"], 2)
+        self.assertEqual(
+            sorted((x["plugin"], x["version"]) for x in body_j["shared_versions"]),
+            [("sh-a", "1.0.0"), ("sh-b", "1.0.0")])
+        self.assertTrue(body_j["package_url"].endswith(
+            "/plugins/sh-a/versions/1.0.0/download"))
+
+    def test_verify_unknown_version_404(self):
+        self.assertEqual(self.verify("ghost", "9.9.9").status_code, 404)
+
+    def test_verify_revoked_version_still_works(self):
+        self.publish("rv-p", "1.0.0", b"rv", expect=201)
+        self.client.post("/api/v1/plugins/rv-p/versions/1.0.0/revoke",
+                         json={"reason": "x"})
+        # 已撤销版本仍可核验
+        r = self.verify("rv-p", "1.0.0")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["revoked"])
+        self.assertEqual(r.json()["state"], "intact")
+
+    def test_repair_requires_token_and_mismatch_rejected(self):
+        body, _sha = self._publish_two_shared()
+        # 未带 token -> 401（写接口沿用 API_TOKEN 规则）
+        with self._api_token("tkn"):
+            r = self.repair_file("sh-a", "1.0.0", body, token=False)
+            self.assertEqual(r.status_code, 401, r.text)
+
+            # 完好包修复：摘要虽对但无需改写 -> result=intact
+            r = self.repair_file("sh-a", "1.0.0", body)
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()["result"], "intact")
+            self.assertEqual(r.json()["previous_state"], "intact")
+
+            # 摘要不符 -> 422 明确拒绝
+            r = self.repair_file("sh-a", "1.0.0", b"different-content")
+            self.assertEqual(r.status_code, 422, r.text)
+            detail = r.json()["detail"]
+            self.assertEqual(detail["code"], "sha256_mismatch")
+            self.assertIn("摘要不符", detail["detail"])
+
+        # 未配置 token 时修复接口开放（与既有写接口一致）
+        self.assertEqual(self.repair_file("sh-a", "1.0.0", body).status_code, 200)
+
+    def test_repair_corrupt_restores_all_shared_versions(self):
+        from app.config import settings
+        body, sha = self._publish_two_shared()
+        path = self._storage_path("sh-a", "1.0.0")
+        with open(path, "wb") as f:
+            f.write(b"corrupted-bytes-here")
+
+        # 损坏：两个共享版本同时报 corrupt
+        v = self.verify("sh-a", "1.0.0").json()
+        self.assertEqual(v["state"], "corrupt")
+        self.assertNotEqual(v["actual_sha256"], sha)
+        self.assertEqual(self.verify("sh-b", "1.0.0").json()["state"], "corrupt")
+
+        # 损坏包不得作为成功下载返回（404，保留 X-SHA256/X-Revoked 头）
+        d = self.client.get("/api/v1/plugins/sh-a/versions/1.0.0/download")
+        self.assertEqual(d.status_code, 404)
+        self.assertEqual(d.headers["x-sha256"], sha)
+        self.assertEqual(d.headers["x-revoked"], "false")
+        self.assertEqual(d.json()["detail"]["code"], "package_corrupt")
+
+        # 原子修复
+        with self._api_token("tkn"):
+            r = self.repair_file("sh-a", "1.0.0", body)
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out["result"], "repaired")
+        self.assertEqual(out["previous_state"], "corrupt")
+        self.assertEqual(out["affected_version_count"], 2)
+        self.assertEqual(
+            sorted((x["plugin"], x["version"]) for x in out["affected_versions"]),
+            [("sh-a", "1.0.0"), ("sh-b", "1.0.0")])
+
+        # 同摘要的其他版本随之恢复，文件内容与完好状态一致
+        for p in ("sh-a", "sh-b"):
+            dd = self.client.get(f"/api/v1/plugins/{p}/versions/1.0.0/download")
+            self.assertEqual(dd.status_code, 200, p)
+            self.assertEqual(dd.content, body)
+            self.assertEqual(dd.headers["x-sha256"], sha)
+        self.assertEqual(self.verify("sh-a", "1.0.0").json()["state"], "intact")
+
+        # 不产生目录修订、不改版本元数据（只有两次发布修订）
+        revs = self.client.get("/api/v1/revisions").json()
+        self.assertEqual([x["revision"] for x in revs], [2, 1, 0])
+        meta = self.client.get("/api/v1/plugins/sh-a/versions/1.0.0").json()
+        self.assertEqual(meta["published_revision"], 1)
+        self.assertIsNone(meta["revoked_revision"])
+
+        # 修复后再提交 -> 无需修复（intact，不改写）
+        with self._api_token("tkn"):
+            again = self.repair_file("sh-a", "1.0.0", body).json()
+        self.assertEqual(again["result"], "intact")
+        self.assertEqual(again["affected_version_count"], 2)
+
+    def test_repair_missing_file(self):
+        body, sha = self._publish_two_shared()
+        path = self._storage_path("sh-a", "1.0.0")
+        os.unlink(path)
+        self.assertEqual(self.verify("sh-a", "1.0.0").json()["state"], "missing")
+        d = self.client.get("/api/v1/plugins/sh-a/versions/1.0.0/download")
+        self.assertEqual(d.status_code, 404)
+        self.assertEqual(d.json()["detail"]["code"], "package_missing")
+        self.assertEqual(d.headers["x-sha256"], sha)
+
+        r = self.repair_file("sh-a", "1.0.0", body)
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out["result"], "repaired")
+        self.assertEqual(out["previous_state"], "missing")
+        self.assertEqual(out["affected_version_count"], 2)
+        for p in ("sh-a", "sh-b"):
+            dd = self.client.get(f"/api/v1/plugins/{p}/versions/1.0.0/download")
+            self.assertEqual(dd.status_code, 200)
+            self.assertEqual(dd.content, body)
+
+    def test_repair_unknown_version_keeps_nothing(self):
+        r = self.repair_file("ghost", "1.0.0", b"x")
+        self.assertEqual(r.status_code, 404, r.text)
+        # 磁盘未遗留任何文件
+        self.assertEqual(self.storage_files(), [])
+
+    def test_repair_concurrent_one_wins_no_partial(self):
+        """并发修复同一缺失文件：全部成功，磁盘唯一文件且内容完好。"""
+        import threading
+        body, sha = self._publish_two_shared()
+        path = self._storage_path("sh-a", "1.0.0")
+        os.unlink(path)
+
+        results = []
+
+        def worker():
+            results.append(self.repair_file("sh-a", "1.0.0", body).status_code)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(results, [200] * 8, results)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), body)
+        self.assertEqual(self.verify("sh-a", "1.0.0").json()["state"], "intact")
+        # 桶目录中只有一个内容寻址文件（无残留临时文件/锁被当成包）
+        files = os.listdir(os.path.dirname(path))
+        self.assertEqual([x for x in files if not x.startswith(".")], [sha])
+
+    def test_audit_packages_filters_and_counts(self):
+        self._publish_two_shared()
+        self.publish("ok-p", "1.0.0", b"fine", expect=201)
+        # 让共享文件损坏：corrupt=2；ok-p 完好：intact=1
+        path = self._storage_path("sh-a", "1.0.0")
+        with open(path, "wb") as f:
+            f.write(b"xx")
+
+        allrep = self.client.get("/api/v1/packages").json()
+        self.assertEqual(allrep["total"], 3)
+        self.assertEqual(allrep["intact"], 1)
+        self.assertEqual(allrep["corrupt"], 2)
+        self.assertEqual(allrep["missing"], 0)
+
+        bad = self.client.get("/api/v1/packages?status=corrupt").json()
+        self.assertEqual(len(bad["items"]), 2)
+        self.assertTrue(all(i["state"] == "corrupt" for i in bad["items"]))
+        self.assertTrue(all(i["shared_version_count"] == 2 for i in bad["items"]))
+        self.assertEqual(
+            sorted(i["plugin"] for i in bad["items"]), ["sh-a", "sh-b"])
+
+        ok = self.client.get("/api/v1/packages?status=intact").json()
+        self.assertEqual([i["plugin"] for i in ok["items"]], ["ok-p"])
+
+        byp = self.client.get("/api/v1/packages?plugin=sh-a").json()
+        self.assertEqual(byp["total"], 1)
+        self.assertEqual(len(byp["items"]), 1)
+
+        miss = self.client.get("/api/v1/packages?status=missing").json()
+        self.assertEqual(miss["items"], [])
+        self.assertEqual(self.client.get(
+            "/api/v1/packages?status=bogus").status_code, 400)
+
+    # ----------------------------------------------------------- test utils
+    @contextlib.contextmanager
+    def _api_token(self, token):
+        from app.config import settings
+        old = settings.api_token
+        object.__setattr__(settings, "api_token", token)
+        try:
+            yield
+        finally:
+            object.__setattr__(settings, "api_token", old)
 
 
 def _json(obj):

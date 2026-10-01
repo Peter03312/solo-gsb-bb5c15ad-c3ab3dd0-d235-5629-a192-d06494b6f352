@@ -2,26 +2,35 @@
 
 包含：
 * 发布元数据校验（版本号、范围、互斥、重复依赖）
-* 安装包 SHA-256 校验与内容寻址原子落盘
+* 安装包 SHA-256 校验、内容寻址原子落盘与原子修复替换
+* 已发布安装包的文件状态核验（完好/缺失/损坏）
 * 请求规范化哈希（同请求同哈希）
 
 ORM 持久化操作见 :mod:`app.repository`。
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
-import shutil
+import uuid
 
 from .solver import Candidate, RuntimeRequirement, Snapshot
 from .version import InvalidSpecifier, InvalidVersion, SpecifierSet, Version
 
 __all__ = [
-    "PublishError", "BatchConflict", "BatchStorageError",
-    "validate_metadata_specs", "verify_sha256",
-    "save_package_atomic", "canonical_request", "canonical_batch",
+    "PublishError", "BatchConflict", "BatchStorageError", "RepairStorageError",
+    "InstallResult",
+    "validate_metadata_specs", "verify_sha256", "sha256_file",
+    "inspect_package", "save_package_atomic", "install_package_atomic",
+    "canonical_request", "canonical_batch",
 ]
+
+# 文件状态：完好 / 缺失 / 损坏（内容与记录摘要不符）
+STATE_OK = "intact"
+STATE_MISSING = "missing"
+STATE_CORRUPT = "corrupt"
 
 
 class PublishError(ValueError):
@@ -38,6 +47,36 @@ class BatchStorageError(IOError):
     def __init__(self, message: str, created_paths: list[str] | None = None):
         super().__init__(message)
         self.created_paths = created_paths or []
+
+
+class RepairStorageError(IOError):
+    """修复替换落盘失败：目标原文件（若有）保持不变。"""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
+class InstallResult:
+    """内容寻址安装/修复结果。
+
+    * ``state`` 为安装后目标文件状态（始终为 ``intact``，损坏时若选择
+      ``replace_corrupt=False`` 则不会进入安装流程，调用方先核验即可）；
+    * ``pre_state`` 为安装前状态：``missing`` / ``intact`` / ``corrupt``；
+    * ``created`` 表示是否新建了文件（供失败批次孤儿回收沿用）；
+    * ``repaired`` 表示是否实际发生了替换（缺失补回或损坏修复）。
+    """
+
+    def __init__(self, *, path: str, size: int, pre_state: str,
+                 created: bool, repaired: bool):
+        self.path = path
+        self.size = size
+        self.pre_state = pre_state
+        self.created = created
+        self.repaired = repaired
+
+    @property
+    def state(self) -> str:
+        return STATE_OK
 
 
 # ---------------------------------------------------------------- 校验
@@ -73,41 +112,189 @@ def validate_metadata_specs(metadata) -> None:
         raise PublishError("插件不能与自身互斥")
 
 
-def verify_sha256(path: str, expected: str) -> None:
+def sha256_file(path: str) -> str:
+    """流式计算文件 SHA-256。"""
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
-    actual = h.hexdigest()
+    return h.hexdigest()
+
+
+def verify_sha256(path: str, expected: str) -> None:
+    actual = sha256_file(path)
     if actual != expected.lower():
         raise PublishError(
             f"安装包摘要不符：声明 {expected}，实际 {actual}，已拒绝写入")
 
 
+def inspect_package(path: str, expected_sha256: str) -> dict:
+    """核验已记录安装包文件的当前状态（只读，不触碰文件）。
+
+    返回 ``{"state": intact|missing|corrupt, "actual_sha256": str|None,
+    "size_bytes": int}``：
+
+    * ``missing``：路径不存在（长期保存介质丢失/卷未挂载）；
+    * ``corrupt``：文件存在但 SHA-256 与记录不符（含被部分写入的文件）；
+    * ``intact``：文件存在且 SHA-256 与记录一致。
+    """
+    expected_sha256 = expected_sha256.lower()
+    if not os.path.exists(path):
+        return {"state": STATE_MISSING, "actual_sha256": None, "size_bytes": 0}
+    actual = sha256_file(path)
+    if actual != expected_sha256:
+        return {"state": STATE_CORRUPT, "actual_sha256": actual,
+                "size_bytes": os.path.getsize(path)}
+    return {"state": STATE_OK, "actual_sha256": actual,
+            "size_bytes": os.path.getsize(path)}
+
+
+def content_addressed_path(sha256: str, dest_dir: str) -> str:
+    """摘要前两字符分桶的内容寻址最终路径。"""
+    return os.path.join(dest_dir, sha256[:2], sha256)
+
+
+@contextlib.contextmanager
+def _digest_lock(sha256: str, dest_dir: str):
+    """对同一摘要（即同一最终路径）的进程间排他锁。
+
+    修复与发布、修复与修复若同时操作同一内容寻址文件，在此串行化，
+    避免并发替换互相覆盖或读到对方的中间临时文件。锁文件置于
+    ``dest_dir/.locks/`` 隐藏目录，不会被存储桶遍历误认成安装包。
+    """
+    import fcntl  # 本服务运行于 Linux（Docker/直跑均为 POSIX 环境）
+
+    lock_dir = os.path.join(dest_dir, ".locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    lock_path = os.path.join(lock_dir, f".{sha256}.lock")
+    with open(lock_path, "a+") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+
+def _fsync_dir(path: str) -> None:
+    """目录 fsync：保证重命名结果落盘（尽力而为，个别文件系统不支持）。"""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _verified_copy(src_path: str, dst_tmp: str, sha256: str) -> int:
+    """流式复制到临时文件并即时复算摘要；不符/写失败不留半成品。
+
+    返回字节数。调用方已在摘要锁内，临时文件名含 uuid 保证并发不互撞。
+    """
+    h = hashlib.sha256()
+    size = 0
+    fd = os.open(dst_tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        with os.fdopen(fd, "wb", closefd=True) as out, open(src_path, "rb") as src:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                h.update(chunk)
+                size += len(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(dst_tmp)
+        raise
+    if h.hexdigest() != sha256.lower():
+        with contextlib.suppress(OSError):
+            os.unlink(dst_tmp)
+        raise PublishError(
+            f"安装包摘要不符：声明 {sha256}，实际 {h.hexdigest()}，已拒绝写入")
+    return size
+
+
+def install_package_atomic(src_path: str, sha256: str, dest_dir: str,
+                           *, replace_corrupt: bool = True,
+                           final_path: str | None = None) -> InstallResult:
+    """在摘要排他锁内把已校验安装包原子安装到内容寻址路径。
+
+    流程（对修复与发布统一）：
+
+    1. 对同一 SHA-256 加进程间排他锁——修复与发布、修复与修复并发时
+       在此串行；
+    2. 复检目标当前状态：``intact`` 直接返回（**完好包不改写**）；
+       ``corrupt`` 仅在 ``replace_corrupt=True`` 时替换，否则保留并返回；
+       ``missing`` 补回；
+    3. 先复制到同目录唯一临时文件、复算摘要并 fsync，再 ``os.replace``
+       原子切换——任何下载请求只可能看到旧文件或完整新文件，绝不会
+       读到部分写入；
+    4. 写盘任一步失败：临时文件清理、原文件保留、向上抛出
+       :class:`RepairStorageError`。
+
+    ``final_path`` 可显式指定目标（修复以版本行记录的 storage_path 为准），
+    默认按内容寻址规则 ``dest_dir/<前两位>/<sha256>``。
+    """
+    sha256 = sha256.lower()
+    target = final_path or content_addressed_path(sha256, dest_dir)
+    bucket = os.path.dirname(target)
+    os.makedirs(bucket, exist_ok=True)
+
+    with _digest_lock(sha256, dest_dir):
+        before = inspect_package(target, sha256)
+        pre_state = before["state"]
+        if pre_state == STATE_OK:
+            return InstallResult(
+                path=target, size=before["size_bytes"], pre_state=pre_state,
+                created=False, repaired=False)
+        if pre_state == STATE_CORRUPT and not replace_corrupt:
+            return InstallResult(
+                path=target, size=before["size_bytes"], pre_state=pre_state,
+                created=False, repaired=False)
+
+        tmp_path = os.path.join(bucket, f".tmp-{os.getpid()}-{uuid.uuid4().hex}")
+        try:
+            size = _verified_copy(src_path, tmp_path, sha256)
+            try:
+                os.replace(tmp_path, target)
+                _fsync_dir(bucket)
+            except OSError as e:
+                # replace 失败：tmp 清理，原文件（存在/损坏）原样保留
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+                raise RepairStorageError(
+                    f"安装包原子替换失败（原文件已保留）: {e}") from e
+        except RepairStorageError:
+            raise
+        except PublishError:
+            raise
+        except OSError as e:
+            raise RepairStorageError(
+                f"安装包写盘失败（原文件已保留）: {e}") from e
+
+        return InstallResult(
+            path=target, size=size, pre_state=pre_state,
+            created=(pre_state == STATE_MISSING),
+            repaired=True)
+
+
 def save_package_atomic(src_path: str, sha256: str, dest_dir: str,
                         ) -> tuple[str, int, bool]:
-    """以 sha256 前两字符分桶做内容寻址，先写临时文件再原子重命名。
+    """发布/批次使用的兼容封装：内容寻址原子落盘。
 
-    返回 ``(最终路径, 字节数, 本次是否真正创建了文件)``。失败批次回滚时
-    只需删除 created=True 的路径——已存在的内容寻址文件可能属于别的
-    （已成功）发布，绝不能动。
+    返回 ``(最终路径, 字节数, 本次是否真正创建了文件)``。若既有的内容
+    寻址文件已损坏（例如落盘后磁盘老化），发布同一摘要时会用新上传的
+    完好文件**原子修复**它；完好文件永不改写。失败批次回滚时只需删除
+    created=True 的路径——已存在且被其它成功发布引用的文件绝不能动。
     """
-    os.makedirs(dest_dir, exist_ok=True)
-    bucket = os.path.join(dest_dir, sha256[:2])
-    os.makedirs(bucket, exist_ok=True)
-    final_path = os.path.join(bucket, sha256)
-    size = os.path.getsize(src_path)
-    created = False
-    if not os.path.exists(final_path):
-        tmp_path = os.path.join(bucket, f".tmp-{os.getpid()}-{sha256}")
-        try:
-            shutil.move(src_path, tmp_path)
-            os.replace(tmp_path, final_path)
-            created = True
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-    return final_path, size, created
+    result = install_package_atomic(src_path, sha256, dest_dir)
+    return result.path, result.size, result.created
 
 
 # ---------------------------------------------------------------- 请求规范化

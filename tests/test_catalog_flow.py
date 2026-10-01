@@ -431,6 +431,140 @@ class MemoryFlowTests(unittest.TestCase):
         self.assertEqual(self.db.revisions, [])
         self.assertNotIn("badsha", self.db.batches)
 
+    # ------------------------------------------------------ 核验与原子修复
+    def test_inspect_states(self):
+        content = b"payload-bytes"
+        sha = hashlib.sha256(content).hexdigest()
+        target = catalog.content_addressed_path(sha, self.pkgdir)
+
+        self.assertEqual(catalog.inspect_package(target, sha)["state"], "missing")
+
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as f:
+            f.write(b"broken")
+        rep = catalog.inspect_package(target, sha)
+        self.assertEqual(rep["state"], "corrupt")
+        self.assertEqual(rep["actual_sha256"], hashlib.sha256(b"broken").hexdigest())
+
+        with open(target, "wb") as f:
+            f.write(content)
+        rep = catalog.inspect_package(target, sha)
+        self.assertEqual(rep["state"], "intact")
+        self.assertEqual(rep["actual_sha256"], sha)
+
+    def test_install_repairs_missing_and_corrupt_but_never_rewrites_intact(self):
+        src_fd, src = tempfile.mkstemp(dir=self.pkgdir)
+        content = b"good-content"
+        with os.fdopen(src_fd, "wb") as f:
+            f.write(content)
+        sha = hashlib.sha256(content).hexdigest()
+        target = catalog.content_addressed_path(sha, self.pkgdir)
+
+        # 缺失 -> 原子补回
+        r = catalog.install_package_atomic(src, sha, self.pkgdir)
+        self.assertTrue(r.created and r.repaired)
+        self.assertEqual(r.pre_state, "missing")
+        self.assertTrue(os.path.exists(target))
+
+        # 完好 -> 不改写（mtime/inode 不变）
+        st_before = os.stat(target)
+        r = catalog.install_package_atomic(src, sha, self.pkgdir)
+        self.assertFalse(r.created or r.repaired)
+        self.assertEqual(r.pre_state, "intact")
+        self.assertEqual(os.stat(target).st_ino, st_before.st_ino)
+
+        # 损坏 -> 原子修复
+        with open(target, "wb") as f:
+            f.write(b"corrupt")
+        r = catalog.install_package_atomic(src, sha, self.pkgdir)
+        self.assertTrue(r.repaired and not r.created)
+        self.assertEqual(r.pre_state, "corrupt")
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), content)
+
+    def test_install_mismatched_digest_rejected_original_kept(self):
+        good_fd, good_src = tempfile.mkstemp(dir=self.pkgdir)
+        with os.fdopen(good_fd, "wb") as f:
+            f.write(b"good")
+        sha = hashlib.sha256(b"good").hexdigest()
+        target = catalog.content_addressed_path(sha, self.pkgdir)
+        catalog.install_package_atomic(good_src, sha, self.pkgdir)
+        # 破坏文件后用"摘要不符"的替换文件 -> 拒绝且原（损坏）文件保留
+        with open(target, "wb") as f:
+            f.write(b"corrupt-original")
+        bad_fd, bad_src = tempfile.mkstemp(dir=self.pkgdir)
+        with os.fdopen(bad_fd, "wb") as f:
+            f.write(b"different-thing")
+        with self.assertRaises(catalog.PublishError):
+            catalog.install_package_atomic(bad_src, sha, self.pkgdir)
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), b"corrupt-original")
+        # 桶目录没有残留临时文件
+        leftovers = [x for x in os.listdir(os.path.dirname(target))
+                     if x.startswith(".tmp-")]
+        self.assertEqual(leftovers, [])
+
+    def test_install_write_failure_keeps_original(self):
+        # 原文件损坏；模拟 os.replace 失败 -> RepairStorageError，原文件保留
+        good_fd, good_src = tempfile.mkstemp(dir=self.pkgdir)
+        with os.fdopen(good_fd, "wb") as f:
+            f.write(b"good")
+        sha = hashlib.sha256(b"good").hexdigest()
+        target = catalog.content_addressed_path(sha, self.pkgdir)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as f:
+            f.write(b"old-corrupt")
+
+        orig_replace = os.replace
+
+        def _fail_replace(src, dst):
+            raise OSError("disk full")
+
+        os.replace = _fail_replace
+        try:
+            with self.assertRaises(catalog.RepairStorageError):
+                catalog.install_package_atomic(good_src, sha, self.pkgdir)
+        finally:
+            os.replace = orig_replace
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), b"old-corrupt")
+        leftovers = [x for x in os.listdir(os.path.dirname(target))
+                     if x.startswith(".tmp-")]
+        self.assertEqual(leftovers, [])
+
+    def test_install_concurrent_repairs_leave_one_intact_file(self):
+        import threading
+        content = b"concurrent-content" * 100
+        sha = hashlib.sha256(content).hexdigest()
+        target = catalog.content_addressed_path(sha, self.pkgdir)
+        srcs = []
+        for _ in range(6):
+            fd, p = tempfile.mkstemp(dir=self.pkgdir)
+            with os.fdopen(fd, "wb") as f:
+                f.write(content)
+            srcs.append(p)
+
+        errors = []
+
+        def worker(src):
+            try:
+                catalog.install_package_atomic(src, sha, self.pkgdir)
+            except Exception as e:  # noqa: BLE001
+                errors.append(repr(e))
+
+        threads = [threading.Thread(target=worker, args=(s,)) for s in srcs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), content)
+        # 唯一最终文件，无临时残留；锁文件隐藏在 .locks 不入桶
+        bucket = [x for x in os.listdir(os.path.dirname(target))
+                  if not x.startswith(".")]
+        self.assertEqual(bucket, [sha])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -249,3 +249,64 @@ class BatchOut(BaseModel):
 class OkOut(BaseModel):
     ok: bool = True
     message: str
+
+
+# ----------------------------------------------------------- 安装包核验与修复
+
+class PackageVersionRef(BaseModel):
+    """共享同一 SHA-256 的一个已发布版本（含已撤销版本）。"""
+    plugin: str
+    version: str
+    revoked: bool = False
+
+
+class PackageVerifyOut(BaseModel):
+    """单个已发布版本安装包的核验结果（读接口，始终开放）。"""
+    plugin: str
+    version: str
+    sha256: str
+    # intact=完好 / missing=文件缺失 / corrupt=内容与记录摘要不符
+    state: str
+    actual_sha256: str | None = None
+    size_bytes: int
+    revoked: bool = False
+    package_url: str
+    # 与该 SHA-256 同摘要（即共享同一物理文件）的版本数，含本版本、含已撤销
+    shared_version_count: int
+    shared_versions: list[PackageVersionRef] = Field(default_factory=list)
+
+
+class PackageRepairOut(BaseModel):
+    """修复替换结果（写接口，需要 API_TOKEN；不改元数据、不产生修订）。"""
+    plugin: str
+    version: str
+    sha256: str
+    # repaired=本次完成缺失补回/损坏替换；intact=原文件完好，未改写
+    result: str
+    previous_state: str
+    size_bytes: int
+    package_url: str
+    # 受本次修复影响（同摘要、共享物理文件）的版本数，含本版本、含已撤销
+    affected_version_count: int
+    affected_versions: list[PackageVersionRef] = Field(default_factory=list)
+
+
+class PackageAuditItem(BaseModel):
+    plugin: str
+    version: str
+    sha256: str
+    state: str
+    actual_sha256: str | None = None
+    size_bytes: int
+    revoked: bool = False
+    shared_version_count: int
+    package_url: str
+
+
+class PackageAuditOut(BaseModel):
+    """全量/筛选核验报告（读接口，始终开放）。"""
+    total: int
+    intact: int
+    missing: int
+    corrupt: int
+    items: list[PackageAuditItem] = Field(default_factory=list)
