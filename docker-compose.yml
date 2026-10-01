@@ -1,0 +1,52 @@
+# 一键启动：docker compose up -d --build
+# 首次启动会自动完成：建库（POSTGRES_DB）、建表、写入第 0 号目录修订。
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-plugindb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-plugindb}
+      POSTGRES_DB: ${POSTGRES_DB:-plugindb}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-plugindb} -d ${POSTGRES_DB:-plugindb}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - labnet
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # 未显式设置 DATABASE_URL 时按下列分项拼接
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-plugindb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-plugindb}
+      POSTGRES_DB: ${POSTGRES_DB:-plugindb}
+      # 也可直接覆盖：
+      # DATABASE_URL: postgresql+psycopg2://plugindb:plugindb@db:5432/plugindb
+      PACKAGE_DIR: /data/packages
+      MAX_UPLOAD_BYTES: "1073741824"
+      # 如需写接口鉴权，取消注释并在 .env 中设置：
+      # API_TOKEN: ${API_TOKEN:-}
+    ports:
+      - "${API_PORT:-8080}:8080"
+    volumes:
+      - packages:/data/packages
+    networks:
+      - labnet
+
+volumes:
+  pgdata:
+  packages:
+
+networks:
+  labnet:
